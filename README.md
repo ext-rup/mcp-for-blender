@@ -143,7 +143,7 @@ In Blender's 3D viewport, press `N` → open the **MCP for Blender** tab → cli
 - [Troubleshooting](#troubleshooting)
 - [Technical Details](#technical-details)
 - [Limitations & Security Considerations](#limitations--security-considerations)
-- [Telemetry Control](#telemetry-control)
+- [Telemetry](#telemetry)
 - [Feedback](#feedback)
 - [Contributing](#contributing)
 - [Disclaimer](#disclaimer)
@@ -725,41 +725,9 @@ The system uses a simple JSON-based protocol over TCP sockets:
 - Poly Haven requires downloading models, textures, and HDRI images. If you do not want to use it, please turn it off in the checkbox in Blender.
 - Complex operations might need to be broken down into smaller steps.
 
-## Telemetry Control
+## Telemetry
 
-Telemetry is **opt-in**. Collection of your content is off by default and stays off until you explicitly turn it on.
-
-**What is collected by default (no opt-in):** a minimal anonymous usage record so I can count active users and see which tools get used — a randomly generated install ID, a session ID, the tool name, whether it succeeded, how long it took, the MCP for Blender and Blender versions, your operating system, and a timestamp.
-
-**Never collected without opting in:** your prompts, generated code, viewport screenshots, scene data, and trajectory steps.
-
-**To opt in** — go to **Edit → Preferences → Add-ons → MCP for Blender** and check the telemetry consent checkbox. Some MCP clients will also offer you a one-time opt-in prompt at the start of a conversation. Opting in adds prompts, generated code, screenshots, and trajectory data to what's collected; see the TnC for details. You can turn it back off in the same place at any time.
-
-**To turn off telemetry entirely**, including the minimal anonymous usage record, set an environment variable:
-
-```bash
-DISABLE_TELEMETRY=true uvx mcp-for-blender
-```
-
-Or add it to your MCP config:
-
-```json
-{
-    "mcpServers": {
-        "blender": {
-            "command": "uvx",
-            "args": ["mcp-for-blender"],
-            "env": {
-                "DISABLE_TELEMETRY": "true"
-            }
-        }
-    }
-}
-```
-
-Telemetry data is not linked to your name or account. It may be used to improve MCP for Blender, for research, and to train AI models.
-
-Full detail on what is collected, and the license you grant by opting in, is in [TERMS_AND_CONDITIONS.md](TERMS_AND_CONDITIONS.md).
+Telemetry has been removed entirely in this fork. No install IDs, session IDs, prompts, code, screenshots, scene data, manual-edit records, or trajectory data are collected or sent anywhere. The upstream telemetry modules (`telemetry.py`, `telemetry_decorator.py` recording, `trajectory.py`, `consent_prompt.py`) were deleted; the remaining decorators are no-op pass-throughs.
 
 ---
 

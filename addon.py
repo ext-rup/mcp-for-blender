@@ -860,269 +860,6 @@ def _polyhaven_tag(datablocks, asset_id, resolution=None, authors=None, dimensio
 #endregion
 
 
-#region Manual edit capture
-# Records what the human does in Blender while an MCP session is live.
-
-MAX_EDIT_EVENTS = 256
-
-# Operators that fire constantly during interactive work and carry no meaningful
-# intent on their own.
-_IGNORED_OPERATORS = frozenset({
-    "view3d.rotate",
-    "view3d.move",
-    "view3d.zoom",
-    "view3d.dolly",
-    "view3d.view_axis",
-    "view3d.view_orbit",
-    "view3d.view_pan",
-    "view3d.smoothview",
-    "view3d.cursor3d",
-    "wm.tool_set_by_id",
-    "wm.context_set_value",
-    "screen.animation_step",
-})
-
-# Operator properties holding filesystem paths. Never recorded.
-_PATH_PROPERTY_NAMES = frozenset({
-    "filepath",
-    "filename",
-    "directory",
-    "filepath_raw",
-    "relpath",
-})
-_PATH_PROPERTY_SUBSTRINGS = ("filepath", "filename", "directory", "_dir", "path")
-MAX_OPERATOR_PROPERTY_CHARS = 200
-
-# depsgraph_update_post fires on every scene update, many times per second
-# during interactive drags.
-EDIT_POLL_MIN_INTERVAL = 0.1
-
-
-def _is_path_property(identifier):
-    """True if an operator property likely holds a filesystem path."""
-    lowered = identifier.lower()
-    if lowered in _PATH_PROPERTY_NAMES:
-        return True
-    return any(token in lowered for token in _PATH_PROPERTY_SUBSTRINGS)
-
-
-class UserEditRecorder:
-    """Buffers human-originated operator and undo events for the MCP server.
-
-    Anything that happens while an agent command is running is attributed to
-    the agent, not the human; `agent_command()` brackets that window.
-    """
-
-    def __init__(self):
-        self._events = deque(maxlen=MAX_EDIT_EVENTS)
-        self._agent_depth = 0
-        self._last_operator_count = 0
-        self._seen_baseline = False
-        self._last_poll_time = 0.0
-
-    @contextmanager
-    def agent_command(self):
-        """Suppress capture for the duration of an agent-issued command."""
-        self._agent_depth += 1
-        try:
-            yield
-        finally:
-            self._agent_depth = max(0, self._agent_depth - 1)
-            self._resync_operator_baseline()
-
-    @property
-    def _suppressed(self):
-        return self._agent_depth > 0
-
-    def _operator_stack(self):
-        try:
-            return list(bpy.context.window_manager.operators)
-        except Exception:
-            return []
-
-    def _resync_operator_baseline(self):
-        self._last_operator_count = len(self._operator_stack())
-        self._seen_baseline = True
-
-    def poll_operators(self, now=None):
-        """Emit rows for operators run since the last poll. Main thread only.
-
-        Throttled to EDIT_POLL_MIN_INTERVAL.
-        """
-        if self._suppressed:
-            return
-        now = time.time() if now is None else now
-        if (now - self._last_poll_time) < EDIT_POLL_MIN_INTERVAL:
-            return
-        self._last_poll_time = now
-        stack = self._operator_stack()
-        count = len(stack)
-
-        # First poll only establishes a baseline.
-        if not self._seen_baseline:
-            self._last_operator_count = count
-            self._seen_baseline = True
-            return
-
-        if count <= self._last_operator_count:
-            # Unchanged, or shrank because of an undo. Hold the high-water
-            # mark so a later redo does not replay emitted operators.
-            return
-
-        for op in stack[self._last_operator_count:count]:
-            self._record_operator(op)
-        self._last_operator_count = count
-
-    def _record_operator(self, op):
-        try:
-            bl_idname = getattr(op, "bl_idname", None)
-            if not bl_idname:
-                return
-            # bl_idname is UPPER_CASE_OT_form; normalise to bpy.ops form.
-            normalized = bl_idname.lower().replace("_ot_", ".", 1)
-            if normalized in _IGNORED_OPERATORS:
-                return
-            self._events.append({
-                "kind": "operator",
-                "bl_idname": normalized,
-                "name": getattr(op, "name", None),
-                "properties": self._operator_properties(op),
-                "timestamp": time.time(),
-            })
-        except Exception as e:
-            print(f"Manual edit capture: failed to record operator: {e}")
-
-    @staticmethod
-    def _operator_properties(op):
-        """Best-effort scalar snapshot of an operator's resolved properties."""
-        props = {}
-        try:
-            rna_props = op.properties.bl_rna.properties
-        except Exception:
-            return props
-        for prop in rna_props:
-            if prop.identifier == "rna_type":
-                continue
-            if _is_path_property(prop.identifier):
-                continue
-            try:
-                value = getattr(op.properties, prop.identifier)
-            except Exception:
-                continue
-            if isinstance(value, str):
-                props[prop.identifier] = value[:MAX_OPERATOR_PROPERTY_CHARS]
-            elif isinstance(value, (bool, int, float)):
-                props[prop.identifier] = value
-            elif hasattr(value, "__len__") and not isinstance(value, (dict, bytes)):
-                try:
-                    items = [
-                        v[:MAX_OPERATOR_PROPERTY_CHARS] if isinstance(v, str) else v
-                        for v in value
-                        if isinstance(v, (bool, int, float, str))
-                    ]
-                    if items and len(items) <= 16:
-                        props[prop.identifier] = items
-                except Exception:
-                    continue
-        return props
-
-    def record_undo(self, kind):
-        """Record an undo/redo. This is the strongest rejection signal we get."""
-        if self._suppressed:
-            return
-        self._events.append({
-            "kind": kind,
-            "timestamp": time.time(),
-        })
-        # Keep the high-water mark so a redo does not re-emit consumed entries.
-        self._last_operator_count = max(
-            self._last_operator_count, len(self._operator_stack())
-        )
-        self._seen_baseline = True
-
-    def drain(self):
-        """Hand buffered events to the MCP server and clear them."""
-        events = list(self._events)
-        self._events.clear()
-        return events
-
-
-_edit_recorder = UserEditRecorder()
-
-
-def get_edit_recorder():
-    return _edit_recorder
-
-
-@persistent
-def _blendermcp_undo_post(scene, depsgraph=None):
-    _edit_recorder.record_undo("undo")
-
-
-@persistent
-def _blendermcp_redo_post(scene, depsgraph=None):
-    _edit_recorder.record_undo("redo")
-
-
-@persistent
-def _blendermcp_depsgraph_post(scene, depsgraph=None):
-    _edit_recorder.poll_operators()
-
-
-def _telemetry_consent_enabled():
-    """Read the consent preference directly. Fails closed."""
-    try:
-        addon_prefs = bpy.context.preferences.addons.get(__name__)
-        if not addon_prefs:
-            return False
-        return bool(addon_prefs.preferences.telemetry_consent)
-    except Exception:
-        return False
-
-
-def _register_edit_capture_handlers():
-    """Attach manual-edit handlers, but only with telemetry consent."""
-    if not _telemetry_consent_enabled():
-        _unregister_edit_capture_handlers()
-        return False
-
-    handlers = [
-        (bpy.app.handlers.undo_post, _blendermcp_undo_post),
-        (bpy.app.handlers.redo_post, _blendermcp_redo_post),
-        (bpy.app.handlers.depsgraph_update_post, _blendermcp_depsgraph_post),
-    ]
-    for handler_list, fn in handlers:
-        if fn not in handler_list:
-            handler_list.append(fn)
-    return True
-
-
-def sync_edit_capture_handlers():
-    """Re-apply the consent gate. Safe to call when consent or server state changes."""
-    try:
-        server_running = bool(
-            getattr(bpy.types, "blendermcp_server", None)
-            and bpy.types.blendermcp_server.running
-        )
-    except Exception:
-        server_running = False
-
-    if not server_running:
-        _unregister_edit_capture_handlers()
-        return False
-    return _register_edit_capture_handlers()
-
-
-def _unregister_edit_capture_handlers():
-    handlers = [
-        (bpy.app.handlers.undo_post, _blendermcp_undo_post),
-        (bpy.app.handlers.redo_post, _blendermcp_redo_post),
-        (bpy.app.handlers.depsgraph_update_post, _blendermcp_depsgraph_post),
-    ]
-    for handler_list, fn in handlers:
-        with suppress(ValueError):
-            handler_list.remove(fn)
-#endregion
 
 
 def get_blendermcp_addon_preferences(context=None):
@@ -1273,8 +1010,6 @@ class BlenderMCPServer:
             self.server_thread.daemon = True
             self.server_thread.start()
 
-            _register_edit_capture_handlers()
-
             # start() is called from the operator, i.e. the main thread, so
             # this is the only safe place to touch bpy.app.timers.
             if not bpy.app.timers.is_registered(self._drain_command_queue):
@@ -1287,9 +1022,6 @@ class BlenderMCPServer:
 
     def stop(self):
         self.running = False
-
-        _unregister_edit_capture_handlers()
-        get_edit_recorder().drain()
 
         try:
             if bpy.app.timers.is_registered(self._drain_command_queue):
@@ -1459,8 +1191,7 @@ class BlenderMCPServer:
     def execute_command(self, command):
         """Execute a command in the main Blender thread"""
         try:
-            with get_edit_recorder().agent_command():
-                return self._execute_command_internal(command)
+            return self._execute_command_internal(command)
 
         except Exception as e:
             print(f"Error executing command: {str(e)}")
@@ -1491,9 +1222,6 @@ class BlenderMCPServer:
             "execute_code": self.execute_code,
             "describe_node_type": self.describe_node_type,
             "bpy_api_lookup": self.bpy_api_lookup,
-            "drain_human_activity": self.drain_human_activity,
-            "get_telemetry_consent": self.get_telemetry_consent,
-            "set_telemetry_consent": self.set_telemetry_consent,
             "get_polyhaven_status": self.get_polyhaven_status,
             "get_hyper3d_status": self.get_hyper3d_status,
             "get_sketchfab_status": self.get_sketchfab_status,
@@ -1579,9 +1307,6 @@ class BlenderMCPServer:
                 "execute_code",
                 "describe_node_type",
                 "bpy_api_lookup",
-                "drain_human_activity",
-                "get_telemetry_consent",
-                "set_telemetry_consent",
             ]),
             "blender_version": bpy.app.version_string,
         }
@@ -1618,22 +1343,6 @@ class BlenderMCPServer:
         except Exception as e:
             print(f"Error in get_scene_info: {str(e)}")
             traceback.print_exc()
-            return {"error": str(e)}
-
-    def drain_human_activity(self):
-        """Return human-originated events buffered since the last drain.
-
-        Consent is enforced MCP-side (the server only drains and uploads when
-        the user has opted in), but we also refuse here so a buffer does not
-        accumulate for a user who has said no.
-        """
-        try:
-            if not self.get_telemetry_consent().get("consent"):
-                get_edit_recorder().drain()
-                return {"events": []}
-            return {"events": get_edit_recorder().drain()}
-        except Exception as e:
-            print(f"Error draining manual edits: {str(e)}")
             return {"error": str(e)}
 
     @staticmethod
@@ -3248,45 +2957,12 @@ class BlenderMCPServer:
             return {"error": f"Failed to apply texture: {str(e)}"}
 
     def get_telemetry_consent(self):
-        """Get the current telemetry consent status.
-
-        Fails closed: if preferences cannot be read we report no consent. Not
-        being able to read the preference means we do not know the user's
-        answer, which is not the same as them having said yes.
-        """
-        try:
-            # Get addon preferences - use the module name
-            addon_prefs = bpy.context.preferences.addons.get(__name__)
-            if addon_prefs:
-                consent = bool(addon_prefs.preferences.telemetry_consent)
-            else:
-                consent = False
-        except (AttributeError, KeyError):
-            consent = False
-        return {"consent": consent}
+        """Telemetry removed in this fork; always reports no consent."""
+        return {"consent": False}
 
     def set_telemetry_consent(self, consent=False):
-        """Write the telemetry consent preference.
-
-        Only reached when the user answered an elicitation prompt in their MCP
-        client, or asked to opt out. Assigning the property in code skips the
-        BoolProperty update= callback, so the manual-edit handlers are
-        re-synced explicitly.
-        """
-        try:
-            addon_prefs = bpy.context.preferences.addons.get(__name__)
-            if not addon_prefs:
-                return {"error": "Could not read addon preferences"}
-            addon_prefs.preferences.telemetry_consent = bool(consent)
-        except (AttributeError, KeyError) as e:
-            return {"error": f"Could not set telemetry consent: {e}"}
-
-        try:
-            sync_edit_capture_handlers()
-        except Exception as e:
-            print(f"BlenderMCP: could not sync manual edit handlers: {e}")
-
-        return {"consent": bool(consent)}
+        """Telemetry removed in this fork; consent is always False."""
+        return {"consent": False}
 
     def get_polyhaven_status(self):
         """Get the current status of PolyHaven integration"""
@@ -4860,19 +4536,7 @@ class BlenderMCPServer:
 # Blender Addon Preferences
 class BLENDERMCP_AddonPreferences(bpy.types.AddonPreferences):
     bl_idname = __name__
-    
-    def _on_telemetry_consent_changed(self, context):
-        try:
-            sync_edit_capture_handlers()
-        except Exception as e:
-            print(f"BlenderMCP: could not sync manual edit handlers: {e}")
 
-    telemetry_consent: BoolProperty(
-        name="Allow Telemetry",
-        description="Opt in to collection of prompts, code snippets, screenshots, and trajectory data to help improve MCP for Blender. Off by default",
-        default=False,
-        update=_on_telemetry_consent_changed,
-    )
     hyper3d_api_key: bpy.props.StringProperty(
         name="Hyper3D API Key",
         subtype="PASSWORD",
@@ -4910,31 +4574,7 @@ class BLENDERMCP_AddonPreferences(bpy.types.AddonPreferences):
 
     def draw(self, context):
         layout = self.layout
-        
-        # Telemetry section
-        layout.label(text="Telemetry & Privacy:", icon='PREFERENCES')
-        
-        box = layout.box()
-        row = box.row()
-        row.prop(self, "telemetry_consent", text="Allow Telemetry")
 
-        # Info text
-        box.separator()
-        if self.telemetry_consent:
-            box.label(text="Opted in: We collect anonymized prompts, code, screenshots,", icon='INFO')
-            box.label(text="and trajectory data (actions, scene state, feedback).", icon='BLANK1')
-        else:
-            box.label(text="Off (default): We only collect minimal anonymous usage data", icon='INFO')
-            box.label(text="(tool names, success/failure, duration - no prompts or code).", icon='BLANK1')
-        box.separator()
-        box.label(text="Data is not linked to your name or account. Change this anytime.", icon='CHECKMARK')
-        
-        # Terms and Conditions link
-        box.separator()
-        row = box.row()
-        row.operator("blendermcp.open_terms", text="View Terms and Conditions", icon='TEXT')
-
-        layout.separator()
         layout.label(text="Persistent API Credentials:", icon='LOCKED')
         cred_box = layout.box()
         cred_box.prop(self, "sketchfab_api_key", text="Sketchfab API Key")
@@ -5117,24 +4757,6 @@ class BLENDERMCP_OT_StopServer(bpy.types.Operator):
 
         return {'FINISHED'}
 
-# Operator to open Terms and Conditions
-class BLENDERMCP_OT_OpenTerms(bpy.types.Operator):
-    bl_idname = "blendermcp.open_terms"
-    bl_label = "View Terms and Conditions"
-    bl_description = "Open the Terms and Conditions document"
-
-    def execute(self, context):
-        # Open the Terms and Conditions on GitHub
-        terms_url = "https://github.com/ahujasid/blender-mcp/blob/main/TERMS_AND_CONDITIONS.md"
-        try:
-            import webbrowser
-            webbrowser.open(terms_url)
-            self.report({'INFO'}, "Terms and Conditions opened in browser")
-        except Exception as e:
-            self.report({'ERROR'}, f"Could not open Terms and Conditions: {str(e)}")
-        
-        return {'FINISHED'}
-
 # Registration functions
 def register():
     bpy.types.Scene.blendermcp_port = IntProperty(
@@ -5291,7 +4913,6 @@ def register():
     bpy.utils.register_class(BLENDERMCP_OT_SetFreeTrialHyper3DAPIKey)
     bpy.utils.register_class(BLENDERMCP_OT_StartServer)
     bpy.utils.register_class(BLENDERMCP_OT_StopServer)
-    bpy.utils.register_class(BLENDERMCP_OT_OpenTerms)
 
     # Add-on registration can run before Blender has a stable UI/scene context.
     # Defer socket startup and retry after startup-file or .blend loads.
@@ -5302,8 +4923,6 @@ def register():
 def unregister():
     _blendermcp_unregister_auto_start()
 
-    _unregister_edit_capture_handlers()
-
     # Stop the server if it's running
     if hasattr(bpy.types, "blendermcp_server") and bpy.types.blendermcp_server:
         bpy.types.blendermcp_server.stop()
@@ -5313,7 +4932,6 @@ def unregister():
     bpy.utils.unregister_class(BLENDERMCP_OT_SetFreeTrialHyper3DAPIKey)
     bpy.utils.unregister_class(BLENDERMCP_OT_StartServer)
     bpy.utils.unregister_class(BLENDERMCP_OT_StopServer)
-    bpy.utils.unregister_class(BLENDERMCP_OT_OpenTerms)
     bpy.utils.unregister_class(BLENDERMCP_AddonPreferences)
 
     del bpy.types.Scene.blendermcp_port
